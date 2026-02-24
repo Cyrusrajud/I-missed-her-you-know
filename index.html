@@ -1,0 +1,563 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Auto Body + Face Cover (Robust)</title>
+
+  <!-- MediaPipe -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/selfie_segmentation.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+
+  <style>
+    body{
+      margin:0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      background:#0b0f1a;
+      color:#e9eefc;
+      display:grid;
+      place-items:center;
+      padding:18px;
+      gap:12px;
+    }
+    .wrap{ width:min(940px, 96vw); }
+    .stage{
+      position:relative;
+      width:100%;
+      aspect-ratio: 900 / 520;
+      border-radius:18px;
+      overflow:hidden;
+      box-shadow: 0 18px 50px rgba(0,0,0,.55);
+      background:#111;
+    }
+    canvas{ width:100%; height:100%; display:block; }
+
+    .hud{
+      position:absolute;
+      left:12px; top:12px;
+      padding:10px 12px;
+      border-radius:12px;
+      background: rgba(0,0,0,.45);
+      border: 1px solid rgba(255,255,255,.14);
+      backdrop-filter: blur(8px);
+      font-size:12px;
+      line-height:1.35;
+      max-width: 70%;
+      z-index: 5;
+    }
+
+    .panel{
+      display:grid;
+      gap:10px;
+      padding:12px;
+      background: rgba(255,255,255,.06);
+      border: 1px solid rgba(255,255,255,.12);
+      border-radius:14px;
+      backdrop-filter: blur(8px);
+    }
+    .row{
+      display:flex;
+      flex-wrap:wrap;
+      gap:10px;
+      align-items:center;
+      justify-content:space-between;
+    }
+    label{ font-size:12px; opacity:.95; display:flex; gap:8px; align-items:center; }
+    input[type="range"]{ width: 240px; }
+    button{
+      border:0; border-radius:12px;
+      padding:10px 12px;
+      font-weight:900;
+      cursor:pointer;
+    }
+    .btn{ background:#e9eefc; color:#0b0f1a; }
+    .btn2{ background:transparent; color:#e9eefc; border:1px solid rgba(255,255,255,.2); }
+    small{ opacity:.75; }
+    input[type="text"]{
+      border-radius:10px; padding:8px;
+      border:1px solid rgba(255,255,255,.18);
+      background: rgba(0,0,0,.22);
+      color:#e9eefc;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="stage">
+      <canvas id="c" width="900" height="520"></canvas>
+      <div class="hud" id="hud">Status: waiting for upload…</div>
+    </div>
+
+    <div class="panel">
+      <div class="row">
+        <label>Upload image: <input type="file" id="file" accept="image/*"></label>
+        <button class="btn" id="play">Play</button>
+        <button class="btn2" id="pause">Pause</button>
+        <button class="btn2" id="export">Export WebM</button>
+      </div>
+
+      <div class="row">
+        <label>Speed
+          <input type="range" id="speed" min="0.5" max="1.4" step="0.01" value="0.85">
+        </label>
+        <label>Hint (show face a bit)
+          <input type="range" id="hint" min="0" max="1" step="0.01" value="0.25">
+        </label>
+        <label>Note text
+          <input type="text" id="noteText" value="I WISH YOU'VE STAYED" style="width:260px;">
+        </label>
+      </div>
+
+      <small>
+        Open using <b>http://localhost:8000</b> (not file://). If it still fails, check Console errors.
+      </small>
+    </div>
+  </div>
+
+<script>
+const W = 900, H = 520;
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const hud = document.getElementById('hud');
+
+const fileInput = document.getElementById('file');
+const playBtn = document.getElementById('play');
+const pauseBtn = document.getElementById('pause');
+const exportBtn = document.getElementById('export');
+const speedEl = document.getElementById('speed');
+const hintEl = document.getElementById('hint');
+const noteTextEl = document.getElementById('noteText');
+
+let speed = parseFloat(speedEl.value);
+let hint = parseFloat(hintEl.value);
+speedEl.addEventListener('input', ()=> speed = parseFloat(speedEl.value));
+hintEl.addEventListener('input', ()=> hint = parseFloat(hintEl.value));
+
+function setHUD(msg){ hud.textContent = "Status: " + msg; }
+
+const bg = new Image();
+bg.src = "sky.jpg";
+
+let userImg = null;
+let segMask = null;
+let faceLandmarks = null;
+
+let playing = false;
+let startTime = 0;
+let pausedAt = 0;
+
+const tmp = document.createElement('canvas');
+tmp.width = W; tmp.height = H;
+const tctx = tmp.getContext('2d');
+
+function drawContainImage(ctx2d, img){
+  const ir = img.width / img.height;
+  const cr = W / H;
+  let dw, dh;
+  if (ir > cr){ dw = W; dh = W / ir; }
+  else { dh = H; dw = H * ir; }
+  const dx = (W - dw) / 2;
+  const dy = (H - dh) / 2;
+  ctx2d.clearRect(0,0,W,H);
+  ctx2d.drawImage(img, dx, dy, dw, dh);
+}
+
+const FACE_OVAL = [
+  10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378,
+  400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21,
+  54, 103, 67, 109
+];
+
+function clipFace(landmarks){
+  ctx.beginPath();
+  const p0 = landmarks[FACE_OVAL[0]];
+  ctx.moveTo(p0.x * W, p0.y * H);
+  for (let i=1;i<FACE_OVAL.length;i++){
+    const p = landmarks[FACE_OVAL[i]];
+    ctx.lineTo(p.x * W, p.y * H);
+  }
+  ctx.closePath();
+  ctx.clip();
+}
+
+// slower timeline (seconds)
+const timeline = [
+  {name:"glitch",   s: 1.0,  e: 5.0},
+  {name:"errors",   s: 4.5,  e: 9.0},
+  {name:"text",     s: 8.5,  e: 13.0},
+  {name:"blank",    s: 12.5, e: 16.5},
+  {name:"note",     s: 16.0, e: 23.0},
+  {name:"doodle",   s: 22.0, e: 26.0},
+  {name:"smoke",    s: 25.0, e: 30.0},
+];
+const BASE_DURATION = 30.0;
+
+function segAlpha(t, s, e){
+  if (t < s || t > e) return 0;
+  const x = (t - s) / (e - s);
+  const edge = 0.18;
+  const fadeIn = Math.min(1, x/edge);
+  const fadeOut = Math.min(1, (1-x)/edge);
+  // simple ease
+  const ease = x < 0.5 ? 2*x*x : 1 - Math.pow(-2*x+2,2)/2;
+  return ease * fadeIn * fadeOut;
+}
+
+// Face-only overlay drawing (draws across canvas but clipped to face)
+function drawGlitch(alpha, t){
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  const jx = Math.sin(t*8) * 6;
+  const jy = Math.cos(t*10) * 4;
+  ctx.translate(jx, jy);
+
+  const g = ctx.createLinearGradient(0,0,W,0);
+  g.addColorStop(0,"rgba(20,200,255,0.85)");
+  g.addColorStop(1,"rgba(255,40,160,0.85)");
+  ctx.fillStyle = g;
+  ctx.fillRect(0,0,W,H);
+
+  ctx.globalAlpha = alpha * 0.7;
+  ctx.fillStyle = "rgba(0,0,0,0.35)";
+  for (let y=0;y<H;y+=14){
+    if ((y/14 + Math.floor(t*6)) % 3 === 0) ctx.fillRect(0,y,W,3);
+  }
+  ctx.restore();
+}
+
+function drawBlank(alpha){
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = "rgba(255,255,255,0.98)";
+  ctx.fillRect(0,0,W,H);
+  ctx.restore();
+}
+
+function drawText(alpha){
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = "rgba(255,255,255,0.96)";
+  ctx.fillRect(W*0.10, H*0.22, W*0.80, H*0.56);
+  ctx.fillStyle = "#111";
+  ctx.font = "950 44px system-ui, sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText("YOU’RE GONE", W*0.5, H*0.42);
+  ctx.fillText("YET YOU’RE STILL", W*0.5, H*0.50);
+  ctx.fillText("HERE", W*0.5, H*0.58);
+  ctx.restore();
+}
+
+function drawErrors(alpha, t){
+  ctx.save();
+  ctx.globalAlpha = alpha;
+
+  function win(x,y,w,h,rot){
+    ctx.save();
+    ctx.translate(x+w/2, y+h/2);
+    ctx.rotate(rot);
+    ctx.translate(-(x+w/2), -(y+h/2));
+
+    ctx.fillStyle = "#e9eefc";
+    ctx.strokeStyle = "rgba(0,0,0,0.18)";
+    ctx.lineWidth = 2;
+    ctx.fillRect(x,y,w,h);
+    ctx.strokeRect(x,y,w,h);
+
+    ctx.fillStyle = "#2f6bff";
+    ctx.fillRect(x,y,w,34);
+
+    ctx.fillStyle = "#fff";
+    ctx.font = "900 16px system-ui, sans-serif";
+    ctx.textBaseline = "middle";
+    ctx.fillText("ERROR!", x+12, y+17);
+    ctx.fillText("✕", x+w-18, y+17);
+
+    ctx.fillStyle = "#111";
+    ctx.font = "800 13px system-ui, sans-serif";
+    ctx.fillText("Click “FIX” to repair.", x+12, y+60);
+
+    ctx.fillStyle = "#fff";
+    ctx.strokeStyle = "rgba(0,0,0,0.18)";
+    ctx.fillRect(x+12, y+74, 62, 26);
+    ctx.strokeRect(x+12, y+74, 62, 26);
+    ctx.fillStyle = "#111";
+    ctx.font = "950 12px system-ui, sans-serif";
+    ctx.fillText("FIX", x+32, y+87);
+
+    ctx.restore();
+  }
+
+  const wob = Math.sin(t*2.6) * 0.04;
+  win(W*0.18, H*0.18, W*0.64, 120, -0.12 + wob);
+  win(W*0.28, H*0.52, W*0.56, 120,  0.10 - wob);
+
+  ctx.restore();
+}
+
+function drawNote(alpha){
+  ctx.save();
+  ctx.globalAlpha = alpha;
+
+  ctx.translate(W*0.5, H*0.5);
+  ctx.rotate(-0.12);
+  ctx.translate(-W*0.5, -H*0.5);
+
+  ctx.fillStyle = "#ffeeb8";
+  ctx.strokeStyle = "rgba(0,0,0,0.12)";
+  ctx.lineWidth = 2;
+  ctx.fillRect(W*0.18, H*0.18, W*0.64, H*0.64);
+  ctx.strokeRect(W*0.18, H*0.18, W*0.64, H*0.64);
+
+  ctx.fillStyle = "#111";
+  ctx.font = "900 42px system-ui, sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+
+  const words = noteTextEl.value.trim().split(/\s+/);
+  const lines = [
+    words.slice(0,2).join(" "),
+    words.slice(2,4).join(" "),
+    words.slice(4).join(" ")
+  ].filter(Boolean);
+
+  const lh = 48;
+  const startY = H*0.5 - ((lines.length-1)*lh)/2;
+  lines.forEach((ln,i)=> ctx.fillText(ln.toUpperCase(), W*0.5, startY + i*lh));
+
+  ctx.restore();
+}
+
+function drawDoodle(alpha, t){
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = "rgba(255,255,255,0.98)";
+  ctx.fillRect(W*0.18, H*0.18, W*0.64, H*0.64);
+
+  ctx.strokeStyle = "#111";
+  ctx.lineWidth = 6;
+  ctx.lineCap = "round";
+  const wiggle = Math.sin(t*3.5)*2;
+
+  ctx.beginPath(); ctx.moveTo(W*0.35, H*0.42); ctx.quadraticCurveTo(W*0.40, H*0.36+wiggle, W*0.45, H*0.42); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(W*0.55, H*0.42); ctx.quadraticCurveTo(W*0.60, H*0.36-wiggle, W*0.65, H*0.42); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(W*0.50, H*0.46); ctx.lineTo(W*0.50, H*0.54); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(W*0.42, H*0.60); ctx.quadraticCurveTo(W*0.50, H*0.68+wiggle, W*0.58, H*0.60); ctx.stroke();
+
+  ctx.restore();
+}
+
+function drawSmoke(alpha, t){
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  const drift = (t*30) % W;
+
+  const grd1 = ctx.createRadialGradient(W*0.35 + drift*0.2, H*0.45, 10, W*0.35 + drift*0.2, H*0.45, W*0.55);
+  grd1.addColorStop(0,"rgba(0,0,0,0.95)");
+  grd1.addColorStop(1,"rgba(0,0,0,0)");
+  ctx.fillStyle = grd1; ctx.fillRect(0,0,W,H);
+
+  const grd2 = ctx.createRadialGradient(W*0.65 - drift*0.15, H*0.55, 10, W*0.65 - drift*0.15, H*0.55, W*0.55);
+  grd2.addColorStop(0,"rgba(0,0,0,0.90)");
+  grd2.addColorStop(1,"rgba(0,0,0,0)");
+  ctx.fillStyle = grd2; ctx.fillRect(0,0,W,H);
+
+  ctx.filter = "blur(10px)";
+  ctx.globalAlpha = alpha*0.7;
+  ctx.fillStyle = "rgba(0,0,0,0.55)";
+  ctx.fillRect(0,0,W,H);
+  ctx.filter = "none";
+
+  ctx.restore();
+}
+
+function renderFrame(t){
+  // background
+  ctx.clearRect(0,0,W,H);
+  if (bg.complete) ctx.drawImage(bg, 0,0,W,H);
+  else { ctx.fillStyle="#101726"; ctx.fillRect(0,0,W,H); }
+
+  if (!userImg || !userImg.complete) return;
+
+  // draw fitted image into tmp
+  drawContainImage(tctx, userImg);
+
+  // draw person cutout
+  ctx.save();
+  ctx.drawImage(tmp, 0,0);
+  if (segMask){
+    ctx.globalCompositeOperation = "destination-in";
+    ctx.drawImage(segMask, 0,0,W,H);
+  }
+  ctx.globalCompositeOperation = "source-over";
+  ctx.restore();
+
+  // if no face landmarks, stop here
+  if (!faceLandmarks) return;
+
+  // clip overlays to face
+  ctx.save();
+  clipFace(faceLandmarks);
+
+  // veil for “hint”
+  const veil = 0.55 - hint * 0.45;
+  if (veil > 0){
+    ctx.save();
+    ctx.globalAlpha = veil;
+    ctx.fillStyle = "black";
+    ctx.fillRect(0,0,W,H);
+    ctx.restore();
+  }
+
+  for (const seg of timeline){
+    const a = segAlpha(t, seg.s, seg.e);
+    if (!a) continue;
+    if (seg.name === "glitch") drawGlitch(a, t);
+    if (seg.name === "errors") drawErrors(a, t);
+    if (seg.name === "text")   drawText(a);
+    if (seg.name === "blank")  drawBlank(a);
+    if (seg.name === "note")   drawNote(a);
+    if (seg.name === "doodle") drawDoodle(a, t);
+    if (seg.name === "smoke")  drawSmoke(a, t);
+  }
+
+  ctx.restore();
+}
+
+// animation loop
+function loop(now){
+  if (!playing) return;
+  const elapsed = (now - startTime) / 1000;
+  const t = (elapsed * speed) % BASE_DURATION;
+  renderFrame(t);
+  requestAnimationFrame(loop);
+}
+
+function play(){
+  if (!userImg) return alert("Upload an image first.");
+  if (!segMask) setHUD("No body mask yet (segmentation failed?) — still showing full image.");
+  if (!faceLandmarks) setHUD("No face found — overlays won’t show. Try a clearer front face.");
+  playing = true;
+  startTime = performance.now() - pausedAt;
+  requestAnimationFrame(loop);
+}
+function pause(){
+  if (!playing) return;
+  playing = false;
+  pausedAt = performance.now() - startTime;
+}
+
+// MediaPipe setup
+setHUD("Loading models…");
+
+const selfieSeg = new SelfieSegmentation({
+  locateFile: (file) => https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/${file}
+});
+selfieSeg.setOptions({
+  modelSelection: 1,
+  selfieMode: false
+});
+selfieSeg.onResults(res => {
+  segMask = res.segmentationMask || null;
+});
+
+const faceMesh = new FaceMesh({
+  locateFile: (file) => https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}
+});
+faceMesh.setOptions({
+  maxNumFaces: 1,
+  refineLandmarks: true,
+  minDetectionConfidence: 0.5,
+  minTrackingConfidence: 0.5
+});
+faceMesh.onResults(res => {
+  faceLandmarks = (res.multiFaceLandmarks && res.multiFaceLandmarks[0]) ? res.multiFaceLandmarks[0] : null;
+});
+
+// process still image once
+async function processImage(){
+  setHUD("Running segmentation + face detection…");
+  segMask = null;
+  faceLandmarks = null;
+
+  await selfieSeg.send({image: userImg});
+  await faceMesh.send({image: userImg});
+
+  if (segMask && faceLandmarks) setHUD("OK ✅ body mask + face found. Press Play.");
+  else if (!faceLandmarks) setHUD("Body OK, but no face found ❌ (try clearer face).");
+  else setHUD("Segmentation failed ❌ (still draws full image). Face: " + (faceLandmarks ? "OK" : "not found"));
+  renderFrame(0);
+}
+
+fileInput.addEventListener('change', (e)=>{
+  const f = e.target.files?.[0];
+  if (!f) return;
+  const url = URL.createObjectURL(f);
+
+  userImg = new Image();
+  userImg.onload = () => processImage().catch(err=>{
+    console.error(err);
+    setHUD("FAILED ❌ Open Console. Also make sure you used http://localhost:8000 (not file://).");
+    alert("Failed. Open DevTools Console to see the exact error.");
+  });
+  userImg.src = url;
+});
+
+playBtn.addEventListener('click', play);
+pauseBtn.addEventListener('click', pause);
+
+// Export WebM
+async function exportVideo(){
+  if (!userImg) return alert("Upload an image first.");
+
+  const stream = canvas.captureStream(60);
+  const candidates = ["video/webm;codecs=vp9","video/webm;codecs=vp8","video/webm"];
+  let mimeType = candidates.find(MediaRecorder.isTypeSupported) || "";
+
+  if (!("MediaRecorder" in window)){
+    alert("MediaRecorder not supported in this browser. Try Chrome/Edge on desktop.");
+    return;
+  }
+
+  const rec = new MediaRecorder(stream, mimeType ? {mimeType} : undefined);
+  const chunks = [];
+  rec.ondataavailable = (ev)=> { if (ev.data && ev.data.size) chunks.push(ev.data); };
+
+  rec.start(200);
+
+  // render full duration once
+  const dur = BASE_DURATION / speed;
+  const start = performance.now();
+
+  await new Promise(resolve=>{
+    function step(now){
+      const elapsed = (now - start) / 1000;
+      const t = Math.min(BASE_DURATION, elapsed * speed);
+      renderFrame(t);
+      if (elapsed < dur) requestAnimationFrame(step);
+      else resolve();
+    }
+    requestAnimationFrame(step);
+  });
+
+  await new Promise(resolve=>{
+    rec.onstop = resolve;
+    rec.stop();
+  });
+
+  const blob = new Blob(chunks, {type: mimeType || "video/webm"});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = "face-cover-animation.webm";
+  a.click();
+  setTimeout(()=> URL.revokeObjectURL(a.href), 2000);
+}
+
+exportBtn.addEventListener('click', exportVideo);
+
+// draw bg initially
+bg.onload = ()=> { ctx.drawImage(bg,0,0,W,H); setHUD("Ready — upload an image."); };
+if (bg.complete) { ctx.drawImage(bg,0,0,W,H); setHUD("Ready — upload an image."); }
+</script>
+</body>
+</html>
